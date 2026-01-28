@@ -1,4 +1,4 @@
-# gcp-secops-data-logging-ingest
+# GCP Secops data logging ingestion script
 Calculate the amount of Google Cloud logs data ingestion to be used for Google SecOps platform. 
 
 This Python script will scan projects within your Google Cloud Organization and calculate the amount of data usage for Cloud Logging.
