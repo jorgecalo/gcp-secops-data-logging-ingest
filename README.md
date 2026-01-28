@@ -9,7 +9,7 @@ This Python script will scan projects within your Google Cloud Organization and 
   Google Workspace Admin Audit logs,
   Enterprise Groups Audit logs,
   Login Audit logs,
-  Access Transparency logs
+  Access Transparency logs.
 
 - Cloud Asset Metadata (CAI):
   Google Cloud asset metadata	
