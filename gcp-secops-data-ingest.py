@@ -1,5 +1,6 @@
 # Google Cloud Logging SecOps Data Ingest calculation script on ORG and project(s)
 # and includes Logging Sinks. Period is 30 days time frame. 
+# Jorge Liauw Calo - 2026
 #
 # ==============================================================================
 # DISCLAIMER
