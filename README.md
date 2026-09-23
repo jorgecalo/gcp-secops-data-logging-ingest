@@ -5,7 +5,7 @@ Estimate how much Google Cloud log data (Cloud Logging) your organization would 
 The Python script scans every active project in your Google Cloud organization, including projects nested in folders. For each project it reports the Cloud Logging volume of the **last 30 days** and the Log Router sink configuration.
 
 > [!NOTE]
-> This is not an official Google tool. The numbers are an estimate based on Cloud Monitoring metrics and do not replace your Google Cloud invoice.
+> This is not an official Google tool. The numbers are an estimate based on Cloud Monitoring metrics and do not replace your Google Cloud invoice or quotes.
 
 ---
 
