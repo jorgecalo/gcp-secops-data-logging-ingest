@@ -27,7 +27,7 @@ try:
     from google.cloud.monitoring_v3 import types
     from google.cloud import service_usage_v1
     from google.cloud import resourcemanager_v3
-    from google.cloud import logging
+    from google.cloud.logging_v2.services.config_service_v2 import ConfigServiceV2Client
 except ImportError as e:
     print("CRITICAL ERROR: Missing required Google Cloud libraries.")
     print(f"Details: {e}")
@@ -37,44 +37,55 @@ except ImportError as e:
 
 def get_projects_in_org(org_id):
     """
-    Lists all ACTIVE projects within the Organization.
+    Lists all ACTIVE projects within the Organization, including projects
+    nested in folders (walked recursively).
     """
     print(f"Searching for active projects in Org ID: {org_id}...")
-    client = resourcemanager_v3.ProjectsClient()
+    projects_client = resourcemanager_v3.ProjectsClient()
+    folders_client = resourcemanager_v3.FoldersClient()
+    active = resourcemanager_v3.Project.State.ACTIVE
     projects = []
-    
+
+    # Breadth-first walk: the org itself, then every folder below it.
+    parents = [f"organizations/{org_id}"]
     try:
-        search_query = f"parent.type:organization parent.id:{org_id} state:ACTIVE"
-        search_request = resourcemanager_v3.SearchProjectsRequest(query=search_query) 
-        for project in client.search_projects(request=search_request):
-            projects.append(project.project_id)
-            
+        while parents:
+            parent = parents.pop(0)
+            for project in projects_client.list_projects(parent=parent):
+                if project.state == active:
+                    projects.append(project.project_id)
+            try:
+                for folder in folders_client.list_folders(parent=parent):
+                    parents.append(folder.name)
+            except Exception as e:
+                print(f"  [!] Could not list folders under {parent}: {e}")
+                print("      Projects inside those folders will be missing from the totals.")
+
     except Exception as e:
         print(f"\n[!] Error listing projects: {e}")
-        print("Tip: Ensure your account has 'Organization Viewer' or 'Folder Viewer' permissions.")
+        print("Tip: Ensure your account has 'Organization Viewer' and 'Folder Viewer' permissions.")
         sys.exit(1)
 
     print(f"Found {len(projects)} active projects.")
     return projects
 
-def check_api_status(project_id):
+def check_api_status(client, project_id):
     """
     Checks if Cloud Monitoring API is enabled.
     """
-    client = service_usage_v1.ServiceUsageClient()
     service_name = f"projects/{project_id}/services/monitoring.googleapis.com"
     try:
         request = service_usage_v1.GetServiceRequest(name=service_name)
         response = client.get_service(request=request)
         return response.state == service_usage_v1.State.ENABLED
-    except:
+    except Exception:
         return False
 
-def get_volume(project_id, specific_log_filter=None):
+def get_volume(client, project_id, specific_log_filter=None):
     """
-    Generic function to get bytes. 
+    Returns the bytes ingested over the last 30 days, or None if the
+    metric could not be read.
     """
-    client = monitoring_v3.MetricServiceClient()
     project_name = f"projects/{project_id}"
     
     # --- Set to 30 days ---
@@ -110,19 +121,24 @@ def get_volume(project_id, specific_log_filter=None):
         )
         total = 0
         for result in results:
-            for point in result.points:
-                total += point.value.int64_value
+            if not result.points:
+                continue
+            # The whole window is a single alignment period. If the API ever
+            # returns more than one point, only the newest one covers exactly
+            # the last 30 days; summing them would double count.
+            latest = max(result.points, key=lambda p: p.interval.end_time)
+            total += latest.value.int64_value
         return total
-    except:
-        return 0
+    except Exception as e:
+        print(f"  [!] Could not read log volume metric: {e}")
+        return None
 
-def print_sink_details(project_id):
+def print_sink_details(client, project_id):
     """
     Fetches and prints Log Router Sinks for a project.
     """
     try:
-        client = logging.Client(project=project_id)
-        sinks = list(client.list_sinks())
+        sinks = list(client.list_sinks(parent=f"projects/{project_id}"))
         
         if not sinks:
             print(f"     [i] No Log Sinks configured.")
@@ -130,17 +146,21 @@ def print_sink_details(project_id):
 
         for sink in sinks:
             print(f"     > Sink Name:       {sink.name}")
-            print(f"       Resource Name:   {sink.writer_identity}")
+            print(f"       Writer Identity: {sink.writer_identity or '(none)'}")
             print(f"       Destination:     {sink.destination}")
-            
-            inc_filter = sink.filter_ if sink.filter_ else "(All Logs)"
+            if sink.disabled:
+                print(f"       Status:          DISABLED")
+
+            inc_filter = sink.filter if sink.filter else "(All Logs)"
             if len(inc_filter) > 80: inc_filter = inc_filter[:77] + "..."
             print(f"       Inclusion Filt:  {inc_filter}")
 
             if sink.exclusions:
                 print(f"       Exclusions:      {len(sink.exclusions)} found")
                 for ex in sink.exclusions:
-                    print(f"         - {ex.name}: {ex.filter_[:60]}...")
+                    ex_filter = ex.filter if len(ex.filter) <= 60 else ex.filter[:57] + "..."
+                    state = " (disabled)" if ex.disabled else ""
+                    print(f"         - {ex.name}{state}: {ex_filter}")
             else:
                 print(f"       Exclusions:      None")
             print("")
@@ -181,8 +201,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(0)
 
-    if not org_id:
-        print("[!] Error: You must enter an Organization ID.")
+    if not org_id.isdigit():
+        print("[!] Error: The Organization ID must be a number, e.g. 123456789.")
         sys.exit(1)
 
     print("-" * 80)
@@ -198,6 +218,12 @@ if __name__ == "__main__":
     # --- New Counters ---
     projects_scanned = 0
     projects_skipped = 0
+    projects_metric_errors = 0
+
+    # Create API clients once and reuse them for every project.
+    usage_client = service_usage_v1.ServiceUsageClient()
+    metric_client = monitoring_v3.MetricServiceClient()
+    sink_client = ConfigServiceV2Client()
     
     print("\nProcessing projects... (This may take a moment)\n")
 
@@ -206,19 +232,23 @@ if __name__ == "__main__":
         print(f"PROJECT: {pid}")
         print("-" * 80)
 
-        if check_api_status(pid):
+        if check_api_status(usage_client, pid):
             # Success Path
             projects_scanned += 1
             
             # 1. Get TOTAL Volume
-            total_bytes = get_volume(pid)
-            cai_bytes = get_volume(pid, specific_log_filter="cloudasset.googleapis.com/temporal_asset")
-            
+            total_bytes = get_volume(metric_client, pid)
+            cai_bytes = get_volume(metric_client, pid, specific_log_filter="cloudasset.googleapis.com/temporal_asset")
+            if total_bytes is None or cai_bytes is None:
+                projects_metric_errors += 1
+            total_bytes = total_bytes or 0
+            cai_bytes = cai_bytes or 0
+
             grand_total_bytes += total_bytes
             grand_cai_bytes += cai_bytes
             
-            gb_total = total_bytes / (1024**3)
-            gb_cai = cai_bytes / (1024**3)
+            gb_total = total_bytes / (1000**3)
+            gb_cai = cai_bytes / (1000**3)
 
             print(f"  VOLUME (Last 30 Days):")
             print(f"  Total Ingest:  {gb_total:,.4f} GB")
@@ -226,7 +256,7 @@ if __name__ == "__main__":
             print("")
             
             print(f"  SINK CONFIGURATION:")
-            print_sink_details(pid)
+            print_sink_details(sink_client, pid)
             
         else:
             # Failure/Skip Path
@@ -234,12 +264,12 @@ if __name__ == "__main__":
             print("  [!] API Disabled or Permission Denied. (SKIPPED)")
 
     # --- Final Calculations ---
-    # Convert bytes to GB and TB
-    total_gb_30d = grand_total_bytes / (1024**3)
-    total_tb_30d = grand_total_bytes / (1024**4)
+    # Convert bytes to decimal GB (10^9 bytes) and TB (10^12 bytes)
+    total_gb_30d = grand_total_bytes / (1000**3)
+    total_tb_30d = grand_total_bytes / (1000**4)
 
-    cai_gb_30d = grand_cai_bytes / (1024**3)
-    cai_tb_30d = grand_cai_bytes / (1024**4)
+    cai_gb_30d = grand_cai_bytes / (1000**3)
+    cai_tb_30d = grand_cai_bytes / (1000**4)
     
     print("=" * 80)
     print("ORGANIZATION TOTALS")
@@ -247,6 +277,8 @@ if __name__ == "__main__":
     print(f"Projects Found:          {len(projects)}")
     print(f"Projects Scanned:        {projects_scanned}")
     print(f"Projects Skipped:        {projects_skipped}")
+    if projects_metric_errors:
+        print(f"Metric Read Errors:      {projects_metric_errors} (counted as 0 bytes)")
     print("-" * 40)
     print(f"TOTAL VOLUME (30 Days):  {total_tb_30d:,.4f} TB")
     print(f"                         ({total_gb_30d:,.2f} GB)")
